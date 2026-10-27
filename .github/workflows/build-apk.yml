@@ -3,8 +3,6 @@ name: Build FitnessTracker APK
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -16,55 +14,72 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Works whether the project is committed as normal files OR as a .zip in the repo root.
-      # Any old "extracted" folder is wiped first so stale files can never be compiled.
+      - name: Show repository contents
+        run: |
+          echo "=== files in repo (depth 3) ==="
+          find . -maxdepth 3 -not -path './.git/*' | sort | head -150
+
+      # Finds the project whether it is committed as normal files or as a .zip anywhere in the repo.
       - name: Locate project
         run: |
           set -euo pipefail
           rm -rf extracted
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
-          if [ -n "$ZIP" ]; then
-            echo "Extracting $ZIP"
-            mkdir extracted
-            unzip -q "$ZIP" -d extracted
-            SEARCH=extracted
-          else
-            SEARCH=.
+          SETTINGS=$(find . -not -path './.git/*' \( -name settings.gradle.kts -o -name settings.gradle \) -type f | head -n1 || true)
+          if [ -z "$SETTINGS" ]; then
+            ZIP=$(find . -not -path './.git/*' -name '*.zip' -type f | head -n1 || true)
+            if [ -n "$ZIP" ]; then
+              echo "No loose project files; extracting $ZIP"
+              mkdir extracted
+              unzip -q "$ZIP" -d extracted
+              SETTINGS=$(find extracted \( -name settings.gradle.kts -o -name settings.gradle \) -type f | head -n1 || true)
+            fi
           fi
-          GRADLEW=$(find "$SEARCH" -name gradlew -type f | head -n1)
-          if [ -z "$GRADLEW" ]; then
-            echo "::error::gradlew not found"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No Android project found. Upload the project files to the repo."
             exit 1
           fi
-          PROJECT_DIR=$(dirname "$GRADLEW")
+          PROJECT_DIR=$(dirname "$SETTINGS")
           echo "Project directory: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      # Android Gradle Plugin 8.x needs JDK 17.
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # The ubuntu-latest runner already ships the Android SDK, so no setup-android action is needed.
+      # Just make sure licenses are accepted so Gradle can fetch any missing platform/build-tools.
+      - name: Accept Android SDK licenses
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null || true
+            "$SDKMANAGER" "platforms;android-35" "build-tools;34.0.0" || true
+          else
+            echo "sdkmanager not found; relying on preinstalled SDK"
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Make gradlew executable
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          sed -i 's/\r$//' gradlew
-          chmod +x gradlew
+        with:
+          gradle-version: 8.9
 
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
         env:
-          # Optional repository secret. If unset, the URL in app/build.gradle.kts is used.
           API_BASE_URL: ${{ secrets.API_BASE_URL }}
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          if [ -f gradlew ]; then
+            sed -i 's/\r$//' gradlew
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace
+          else
+            echo "gradlew missing - using Gradle 8.9 from PATH"
+            gradle assembleDebug --stacktrace
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
